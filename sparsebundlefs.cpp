@@ -1,11 +1,37 @@
+/*
+ * Copyright (c) 2012-2016 Tor Arne Vestbø. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <syslog.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -26,8 +52,9 @@ using namespace std;
 
 static const char image_path[] = "/sparsebundle.dmg";
 
-struct sparsebundle_data {
+struct sparsebundle_t {
     char *path;
+    char *mountpoint;
     off_t band_size;
     off_t size;
     off_t times_opened;
@@ -36,35 +63,48 @@ struct sparsebundle_data {
 #endif
 };
 
-#define SB_DATA_CAST(ptr) ((struct sparsebundle_data *) ptr)
-#define SB_DATA (SB_DATA_CAST(fuse_get_context()->private_data))
+#define sparsebundle_current() \
+    static_cast<sparsebundle_t *>(fuse_get_context()->private_data)
 
-static int sparsebundle_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-              off_t offset, struct fuse_file_info *fi)
+static int sparsebundle_getattr(const char *path, struct stat *stbuf)
 {
-    if (strcmp(path, "/") != 0)
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
+    memset(stbuf, 0, sizeof(struct stat));
+
+    struct stat bundle_stat;
+    stat(sparsebundle->path, &bundle_stat);
+
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0555;
+        stbuf->st_nlink = 3;
+        stbuf->st_size = sizeof(sparsebundle_t);
+    } else if (strcmp(path, image_path) == 0) {
+        stbuf->st_mode = S_IFREG | 0444;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = sparsebundle->size;
+    } else
         return -ENOENT;
 
-    filler(buf, ".", 0, 0);
-    filler(buf, "..", 0, 0);
-    filler(buf, image_path + 1, 0, 0);
+    stbuf->st_atime = bundle_stat.st_atime;
+    stbuf->st_mtime = bundle_stat.st_mtime;
+    stbuf->st_ctime = bundle_stat.st_ctime;
 
     return 0;
 }
 
-static int sparsebundle_getattr(const char *path, struct stat *stbuf)
+static int sparsebundle_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+              off_t /* offset */, struct fuse_file_info *)
 {
-    memset(stbuf, 0, sizeof(struct stat));
-
-    if (strcmp(path, "/") == 0) {
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 3;
-    } else if (strcmp(path, image_path) == 0) {
-        stbuf->st_mode = S_IFREG | 0444;
-        stbuf->st_nlink = 1;
-        stbuf->st_size = SB_DATA->size;
-    } else
+    if (strcmp(path, "/") != 0)
         return -ENOENT;
+
+    struct stat image_stat;
+    sparsebundle_getattr(image_path, &image_stat);
+
+    filler(buf, ".", 0, 0);
+    filler(buf, "..", 0, 0);
+    filler(buf, image_path + 1, &image_stat, 0);
 
     return 0;
 }
@@ -77,9 +117,11 @@ static int sparsebundle_open(const char *path, struct fuse_file_info *fi)
     if ((fi->flags & O_ACCMODE) != O_RDONLY)
         return -EACCES;
 
-    SB_DATA->times_opened++;
-    syslog(LOG_DEBUG, "opened %s, now referenced %llx times",
-        SB_DATA->path, SB_DATA->times_opened);
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
+    sparsebundle->times_opened++;
+    syslog(LOG_DEBUG, "opened %s%s, now referenced %ju times",
+        sparsebundle->mountpoint, path, uintmax_t(sparsebundle->times_opened));
 
     return 0;
 }
@@ -96,30 +138,32 @@ static int sparsebundle_iterate_bands(const char *path, size_t length, off_t off
     if (strcmp(path, image_path) != 0)
         return -ENOENT;
 
-    if (offset >= SB_DATA->size)
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
+    if (offset >= sparsebundle->size)
         return 0;
 
-    if (offset + length > SB_DATA->size)
-        length = SB_DATA->size - offset;
+    if (offset + length > sparsebundle->size)
+        length = sparsebundle->size - offset;
 
-    syslog(LOG_DEBUG, "iterating %zu bytes at offset %llu", length, offset);
+    syslog(LOG_DEBUG, "iterating %zu bytes at offset %ju", length, uintmax_t(offset));
 
     size_t bytes_read = 0;
     while (bytes_read < length) {
-        off_t band_number = (offset + bytes_read) / SB_DATA->band_size;
-        off_t band_offset = (offset + bytes_read) % SB_DATA->band_size;
+        off_t band_number = (offset + bytes_read) / sparsebundle->band_size;
+        off_t band_offset = (offset + bytes_read) % sparsebundle->band_size;
 
         ssize_t to_read = min(static_cast<off_t>(length - bytes_read),
-            SB_DATA->band_size - band_offset);
+            sparsebundle->band_size - band_offset);
 
         char *band_path;
-        if (asprintf(&band_path, "%s/bands/%llx", SB_DATA->path, band_number) == -1) {
+        if (asprintf(&band_path, "%s/bands/%jx", sparsebundle->path, uintmax_t(band_number)) == -1) {
             syslog(LOG_ERR, "failed to resolve band name");
             return -errno;
         }
 
-        syslog(LOG_DEBUG, "processing %zu bytes from band %llx at offset %llu",
-            to_read, band_number, band_offset);
+        syslog(LOG_DEBUG, "processing %zu bytes from band %jx at offset %ju",
+            to_read, uintmax_t(band_number), uintmax_t(band_offset));
 
         ssize_t read = read_ops->process_band(band_path, to_read, band_offset, read_ops->data);
         if (read < 0) {
@@ -131,15 +175,15 @@ static int sparsebundle_iterate_bands(const char *path, size_t length, off_t off
 
         if (read < to_read) {
             to_read = to_read - read;
-            syslog(LOG_DEBUG, "missing %zu bytes from band %llx, padding with zeroes",
-                to_read, band_number);
+            syslog(LOG_DEBUG, "missing %zu bytes from band %jx, padding with zeroes",
+                to_read, uintmax_t(band_number));
             read += read_ops->pad_with_zeroes(to_read, read_ops->data);
         }
 
         bytes_read += read;
 
-        syslog(LOG_DEBUG, "done processing band %llx, %zu bytes left to read",
-                band_number, length - bytes_read);
+        syslog(LOG_DEBUG, "done processing band %jx, %zu bytes left to read",
+                uintmax_t(band_number), length - bytes_read);
     }
 
     assert(bytes_read == length);
@@ -152,8 +196,8 @@ static int sparsebundle_read_process_band(const char *band_path, size_t length, 
 
     char** buffer = static_cast<char**>(read_data);
 
-    syslog(LOG_DEBUG, "reading %zu bytes at offset %llu into %p",
-        length, offset, *buffer);
+    syslog(LOG_DEBUG, "reading %zu bytes at offset %ju into %p",
+        length, uintmax_t(offset), *buffer);
 
     int band_file = open(band_path, O_RDONLY);
     if (band_file != -1) {
@@ -187,7 +231,7 @@ static int sparsebundle_read_pad_with_zeroes(size_t length, void *read_data)
 }
 
 static int sparsebundle_read(const char *path, char *buffer, size_t length, off_t offset,
-           struct fuse_file_info *fi)
+           struct fuse_file_info *)
 {
     sparsebundle_read_operations read_ops = {
         &sparsebundle_read_process_band,
@@ -195,22 +239,24 @@ static int sparsebundle_read(const char *path, char *buffer, size_t length, off_
         &buffer
     };
 
-    syslog(LOG_DEBUG, "asked to read %zu bytes at offset %llu", length, offset);
+    syslog(LOG_DEBUG, "asked to read %zu bytes at offset %ju", length, uintmax_t(offset));
 
     return sparsebundle_iterate_bands(path, length, offset, &read_ops);
 }
 
 #if FUSE_SUPPORTS_ZERO_COPY
-int sparsebundle_read_buf_prepare_file(const char *path)
+static int sparsebundle_read_buf_prepare_file(const char *path)
 {
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
     int fd = -1;
-    map<string, int>::const_iterator iter = SB_DATA->open_files.find(path);
-    if (iter != SB_DATA->open_files.end()) {
+    map<string, int>::const_iterator iter = sparsebundle->open_files.find(path);
+    if (iter != sparsebundle->open_files.end()) {
         fd = iter->second;
     } else {
         syslog(LOG_DEBUG, "file %s not opened yet, opening", path);
         fd = open(path, O_RDONLY);
-        SB_DATA->open_files[path] = fd;
+        sparsebundle->open_files[path] = fd;
     }
 
     return fd;
@@ -222,7 +268,8 @@ static int sparsebundle_read_buf_process_band(const char *band_path, size_t leng
 
     vector<fuse_buf> *buffers = static_cast<vector<fuse_buf>*>(read_data);
 
-    syslog(LOG_DEBUG, "preparing %zu bytes at offset %llu", length, offset);
+    syslog(LOG_DEBUG, "preparing %zu bytes at offset %ju", length,
+        uintmax_t(offset));
 
     int band_file_fd = sparsebundle_read_buf_prepare_file(band_path);
     if (band_file_fd != -1) {
@@ -256,17 +303,21 @@ static int sparsebundle_read_buf_pad_with_zeroes(size_t length, void *read_data)
 
 static void sparsebundle_read_buf_close_files()
 {
-    syslog(LOG_DEBUG, "closing %u open file descriptor(s)", SB_DATA->open_files.size());
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+
+    syslog(LOG_DEBUG, "closing %u open file descriptor(s)", sparsebundle->open_files.size());
 
     map<string, int>::iterator iter;
-    for(iter = SB_DATA->open_files.begin(); iter != SB_DATA->open_files.end(); ++iter)
+    for(iter = sparsebundle->open_files.begin(); iter != sparsebundle->open_files.end(); ++iter) {
         close(iter->second);
+        syslog(LOG_DEBUG, "closed %s", iter->first.c_str());
+    }
 
-    SB_DATA->open_files.clear();
+    sparsebundle->open_files.clear();
 }
 
 static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
-                        size_t length, off_t offset, struct fuse_file_info *fi)
+                        size_t length, off_t offset, struct fuse_file_info *)
 {
     int ret = 0;
 
@@ -278,14 +329,18 @@ static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
         &buffers
     };
 
-    syslog(LOG_DEBUG, "asked to read %zu bytes at offset %llu using zero-copy read",
-        length, offset);
+    syslog(LOG_DEBUG, "asked to read %zu bytes at offset %ju using zero-copy read",
+        length, uintmax_t(offset));
 
-    static struct rlimit fd_limit = { -1, -1 };
-    if (fd_limit.rlim_cur < 0)
+    static struct rlimit fd_limit;
+    static bool fd_limit_computed = false;
+    if (!fd_limit_computed) {
         getrlimit(RLIMIT_NOFILE, &fd_limit);
+        fd_limit_computed = true;
+    }
 
-    if (SB_DATA->open_files.size() + 1 >= fd_limit.rlim_cur) {
+    sparsebundle_t *sparsebundle = sparsebundle_current();
+    if (sparsebundle->open_files.size() + 1 >= fd_limit.rlim_cur) {
         syslog(LOG_DEBUG, "hit max number of file descriptors");
         sparsebundle_read_buf_close_files();
     }
@@ -312,17 +367,19 @@ static int sparsebundle_read_buf(const char *path, struct fuse_bufvec **bufp,
 }
 #endif
 
-static int sparsebundle_release(const char *path, struct fuse_file_info *fi)
+static int sparsebundle_release(const char *path, struct fuse_file_info *)
 {
-    SB_DATA->times_opened--;
-    syslog(LOG_DEBUG, "closed %s, now referenced %llx times",
-        SB_DATA->path, SB_DATA->times_opened);
+    sparsebundle_t *sparsebundle = sparsebundle_current();
 
-    if (SB_DATA->times_opened == 0) {
+    sparsebundle->times_opened--;
+    syslog(LOG_DEBUG, "closed %s%s, now referenced %ju times",
+        sparsebundle->mountpoint, path, uintmax_t(sparsebundle->times_opened));
+
+    if (sparsebundle->times_opened == 0) {
         syslog(LOG_DEBUG, "no more references, cleaning up");
 
 #if FUSE_SUPPORTS_ZERO_COPY
-        if (!SB_DATA->open_files.empty())
+        if (!sparsebundle->open_files.empty())
             sparsebundle_read_buf_close_files();
 #endif
     }
@@ -330,38 +387,65 @@ static int sparsebundle_release(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
+__attribute__((noreturn, format(printf, 1, 2))) static void sparsebundle_fatal_error(const char *message, ...)
+{
+    fprintf(stderr, "sparsebundlefs: ");
+
+    va_list args;
+    va_start(args, message);
+    vfprintf(stderr, message, args);
+    va_end(args);
+
+    if (errno)
+        fprintf(stderr, ": %s", strerror(errno));
+
+    fprintf(stderr, "\n");
+
+    exit(EXIT_FAILURE);
+}
+
 static int sparsebundle_show_usage(char *program_name)
 {
-    fprintf(stderr, "usage: %s [-o options] [-f] [-D] <sparsebundle> <mountpoint>\n", program_name);
+    fprintf(stderr, "usage: %s [-o options] [-s] [-f] [-D] <sparsebundle> <mountpoint>\n", program_name);
     return 1;
 }
 
-enum { SPARSEBUNDLE_OPT_DEBUG };
+enum { SPARSEBUNDLE_OPT_DEBUG = 0, SPARSEBUNDLE_OPT_HANDLED = 0, SPARSEBUNDLE_OPT_IGNORED = 1 };
 
 static int sparsebundle_opt_proc(void *data, const char *arg, int key, struct fuse_args *outargs)
 {
     switch (key) {
     case SPARSEBUNDLE_OPT_DEBUG:
         setlogmask(LOG_UPTO(LOG_DEBUG));
-        return 0;
-    case FUSE_OPT_KEY_NONOPT:
-        if (SB_DATA_CAST(data)->path)
-            return 1;
+        return SPARSEBUNDLE_OPT_HANDLED;
 
-        SB_DATA_CAST(data)->path = strdup(arg);
-        return 0;
+    case FUSE_OPT_KEY_NONOPT:
+        sparsebundle_t *sparsebundle = static_cast<sparsebundle_t *>(data);
+
+        if (!sparsebundle->path) {
+            sparsebundle->path = realpath(arg, 0);
+            if (!sparsebundle->path)
+                sparsebundle_fatal_error("bad sparse-bundle `%s'", arg);
+            return SPARSEBUNDLE_OPT_HANDLED;
+        } else if (!sparsebundle->mountpoint) {
+            sparsebundle->mountpoint = realpath(arg, 0);
+            if (!sparsebundle->mountpoint)
+                sparsebundle_fatal_error("bad mount point `%s'", arg);
+            fuse_opt_add_arg(outargs, sparsebundle->mountpoint);
+            return SPARSEBUNDLE_OPT_HANDLED;
+        }
+
+        return SPARSEBUNDLE_OPT_IGNORED;
     }
 
-    return 1;
+    return SPARSEBUNDLE_OPT_IGNORED;
 }
 
 static off_t read_size(const string &str)
 {
     uintmax_t value = strtoumax(str.c_str(), 0, 10);
-    if (errno == ERANGE || value > static_cast<uintmax_t>(numeric_limits<off_t>::max())) {
-        fprintf(stderr, "Disk image too large to be mounted (%s bytes)\n", str.c_str());
-        exit(EXIT_FAILURE);
-    }
+    if (errno == ERANGE || value > uintmax_t(numeric_limits<off_t>::max()))
+        sparsebundle_fatal_error("disk image too large (%s bytes)", str.c_str());
 
     return value;
 }
@@ -371,33 +455,26 @@ int main(int argc, char **argv)
     openlog("sparsebundlefs", LOG_CONS | LOG_PERROR, LOG_USER);
     setlogmask(~(LOG_MASK(LOG_DEBUG)));
 
-    struct sparsebundle_data data = {};
+    struct sparsebundle_t sparsebundle = {};
 
     static struct fuse_opt sparsebundle_options[] = {
-        FUSE_OPT_KEY("-D",  SPARSEBUNDLE_OPT_DEBUG), FUSE_OPT_END
+        FUSE_OPT_KEY("-D",  SPARSEBUNDLE_OPT_DEBUG),
+        { 0, 0, 0 } // End of options
     };
 
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-    fuse_opt_parse(&args, &data, sparsebundle_options, sparsebundle_opt_proc);
+    fuse_opt_parse(&args, &sparsebundle, sparsebundle_options, sparsebundle_opt_proc);
     fuse_opt_add_arg(&args, "-oro"); // Force read-only mount
 
-    if (!data.path)
+    if (!sparsebundle.path || !sparsebundle.mountpoint)
         return sparsebundle_show_usage(argv[0]);
 
-    char *abs_path = realpath(data.path, 0);
-    if (!abs_path) {
-        perror("Could not resolve absolute path");
-        return EXIT_FAILURE;
-    }
-
-    free(data.path);
-    data.path = abs_path;
+    syslog(LOG_DEBUG, "mounting `%s' at mount-point `%s'",
+        sparsebundle.path, sparsebundle.mountpoint);
 
     char *plist_path;
-    if (asprintf(&plist_path, "%s/Info.plist", data.path) == -1) {
-        perror("Failed to resolve Info.plist path");
-        return EXIT_FAILURE;
-    }
+    if (asprintf(&plist_path, "%s/Info.plist", sparsebundle.path) == -1)
+        sparsebundle_fatal_error("could not resolve Info.plist path");
 
     ifstream plist_file(plist_path);
     stringstream plist_data;
@@ -416,16 +493,16 @@ int main(int argc, char **argv)
             line.erase(line.find_first_of('<'));
 
             if (key == "band-size")
-                data.band_size = read_size(line);
+                sparsebundle.band_size = read_size(line);
             else if (key == "size")
-                data.size = read_size(line);
+                sparsebundle.size = read_size(line);
 
             key.clear();
         }
     }
 
-    syslog(LOG_DEBUG, "initialized %s, band size %llu, total size %llu",
-        data.path, data.band_size, data.size);
+    syslog(LOG_DEBUG, "bundle has band size %ju and total size %ju",
+        uintmax_t(sparsebundle.band_size), uintmax_t(sparsebundle.size));
 
     struct fuse_operations sparsebundle_filesystem_operations = {};
     sparsebundle_filesystem_operations.getattr = sparsebundle_getattr;
@@ -437,5 +514,5 @@ int main(int argc, char **argv)
     sparsebundle_filesystem_operations.read_buf = sparsebundle_read_buf;
 #endif
 
-    return fuse_main(args.argc, args.argv, &sparsebundle_filesystem_operations, &data);
+    return fuse_main(args.argc, args.argv, &sparsebundle_filesystem_operations, &sparsebundle);
 }

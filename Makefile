@@ -1,7 +1,13 @@
 TARGET = sparsebundlefs
 
 PKG_CONFIG = pkg-config
-CFLAGS = -Wall -O2 -march=native
+override CFLAGS += -Wall -O2 -g
+
+GCC_4_2_OR_HIGHER := $(shell expr `$(CXX) -dumpversion | sed 's/\.//g'` \>= 420)
+ifeq "$(GCC_4_2_OR_HIGHER)" "1"
+    CFLAGS += -march=native
+endif
+
 DEFINES = -DFUSE_USE_VERSION=26
 
 ifeq ($(shell uname), Darwin)
@@ -20,3 +26,4 @@ all: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
+	rm -Rf $(TARGET).dSYM
